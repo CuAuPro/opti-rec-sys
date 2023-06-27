@@ -1,0 +1,55 @@
+{
+	"engine":{
+			"data"	        : "engine/data/RecSysData.pickle",
+			"model"		      : "engine/model_fm_mlp.pt",
+			"categorizers"	: "engine/categorizers.pickle",
+			"sc_coil"		    : "engine/sc_coil.pickle",
+      "sc_recipe"		  : "engine/sc_recipe.pickle",
+      "coil_dict"     : "engine/coil_dict.pickle",
+      "recipe_dict"		: "engine/recipe_dict.pickle"
+		},
+
+
+  "recipe_bounds":
+    [
+      [
+        [0.0, 0.0],
+        [0.0, 0.0],
+        [0.0, 0.0]
+      ],
+      [
+        [26.1, 57.81],
+        [209.69, 350.52],
+        [53.36, 271.4]
+      ],
+      [
+        [99.64, 149.49],
+        [169.53, 349.54],
+        [120.4, 550.42]
+      ],
+      [
+        [79.7, 125.06],
+        [119.66, 269.44],
+        [136.38, 621.92]
+      ],
+      [
+        [69.72, 91.72],
+        [89.68, 180.39],
+        [131.93, 625.72]
+      ],
+      [
+        [51.32, 73.77],
+        [53.23, 100.86],
+        [129.44, 629.14]
+      ],
+      [
+        [55.39, 73.81],
+        [64.32, 100.85],
+        [120.0, 630.0]
+      ]
+    ],
+    
+	"logger":{
+		"__comment"					: "For further use...."
+	}
+}

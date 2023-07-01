@@ -24,6 +24,8 @@ import engine.optimizer_adv as optimizer_adv
 from engine.utils import most_similar_index, importConfig, calculateCriterion, calc_dh_tol
 from ZRMlib.profile_generator import trapezoidal_profile
 
+from sklearn.cluster import DBSCAN
+
 from scipy import stats
 
 ##################################################
@@ -34,6 +36,7 @@ N_min_similar_coil_classes = 5  # Used for selection of N_similar_coils (meaning
                                 # N_similar_coils, when simi_thresh_similar_coils used
                      
 N_best_recipes = 7          # Used for selection of best performed N_best_recipes recipes
+N_best_recipes_clust = 20
 opt_lambda1_def = 0.5       # Optimization parameter (Higher value give more importance on quality).
 opt_method_def = 'Powell'   # Optimization method
 dh_tol_def = 6.0
@@ -41,7 +44,6 @@ dh_tol_def = 6.0
 
 settings.init()
 out = importConfig("engine/config.json")
-
 device = torch.device("cpu")
 #print("Inference on CPU")
 
@@ -121,8 +123,23 @@ class ZRMrecsys():
             self._infer_type = infer_type
         
         return
-
     def optimize(self, coil_df:pd.DataFrame, pass_nr:int, dh_tol:float=dh_tol_def, opt_lambda1:float=opt_lambda1_def, opt_method:str=opt_method_def):
+        res1 = recsys_obj.optimize_1(coil_df, pass_nr, dh_tol, opt_lambda1, opt_method)
+        res1['Jtot'] = calculateCriterion(res1["velocity_mdr"].values, res1["pred"].values,
+                                               self.bounds[pass_nr], dh_tol=dh_tol, lambda1=opt_lambda1)
+        
+        res2 = recsys_obj.optimize_2(coil_df, pass_nr, dh_tol, opt_lambda1, opt_method)
+        res2['Jtot'] = calculateCriterion(res2["velocity_mdr"].values, res2["pred"].values,
+                                               self.bounds[pass_nr], dh_tol=dh_tol, lambda1=opt_lambda1)
+        
+        # Compare the Jtot values
+        if res1['Jtot'].iloc[0] < res2['Jtot'].iloc[0]:
+            res = res1
+        else:
+            res = res2
+        res = res.drop(columns='Jtot')
+    
+    def optimize_1(self, coil_df:pd.DataFrame, pass_nr:int, dh_tol:float=dh_tol_def, opt_lambda1:float=opt_lambda1_def, opt_method:str=opt_method_def):
         """Model based recipe optimization
 
 
@@ -147,7 +164,6 @@ class ZRMrecsys():
 
         # calculate moroe tight bounds (based on recipe_idx bins)
         bounds = self.tight_bounds(new_recipe_idx[0], pass_nr)
-        #print(bounds)
         bounds=None
         # prepare new_recipe_idx
         x_args = torch.Tensor(sc_coil.transform(new_coil[self.coil_columns])).to(torch.float32)
@@ -161,7 +177,7 @@ class ZRMrecsys():
 
         return final_res_opt
 
-    def optimize_adv(self, coil_df:pd.DataFrame, pass_nr:int, dh_tol:float=dh_tol_def, opt_lambda1:float=opt_lambda1_def, opt_method:str=opt_method_def):
+    def optimize_2(self, coil_df:pd.DataFrame, pass_nr:int, dh_tol:float=dh_tol_def, opt_lambda1:float=opt_lambda1_def, opt_method:str=opt_method_def):
         """Model based recipe optimization - pymoo optimization library
 
 
@@ -301,7 +317,95 @@ class ZRMrecsys():
         final_res['pred'] = self.predictQuality(final_res, new_coil, new_coil_idx)
 
         return final_res, new_coil, new_coil_idx, new_recipe_idx
-    
+
+    def recommendClust(self, coil_df:pd.DataFrame, pass_nr:int, dh_tol:float=dh_tol_def, opt_lambda1:float=opt_lambda1_def):
+        """Recommend recipe settings based on coil similarity
+
+        Args:
+            coil_df (pd.DataFrame): One row DataFrame with coil data
+            pass_nr (int): Pass number (necessary for bounds setting)
+            dh_tol (float, optional): Thickness deviation tolerance. Defaults to dh_tol_def.
+            opt_lambda1 (float, optional): Optimization parameter (Higher value give more importance on quality). Defaults to opt_lambda1_def.
+
+        Returns:
+            _type_: _description_
+        """
+        
+        new_coil = feature_engineering(coil_df)
+        new_coil = new_coil[['pass_nr'] + self.coil_columns]
+        
+        # Binarize data
+        new_coil_bin = pd.DataFrame()
+        for column in self.coil_columns:
+          new_coil_bin[column]  = get_bin_labels(new_coil[column].values, categorizers[column], padding=2)
+        coil_idx = new_coil_bin[self.coil_columns].astype(str).apply(lambda x: ''.join(x), axis=1)
+        coil_idx = coil_idx.values
+        new_coil_bin = new_coil_bin.astype(int)
+
+        # Find similar coil if necessary
+        if not (coil_idx in list(coil_dict.keys())):
+            print("Finding similar of: {}".format(coil_idx))
+            coil_idx = most_similar_index(coil_idx[0], list(coil_dict.keys()))
+            coil_idx = [coil_idx]  # Convert to suitable type for transforming in tensor
+            print("Found similar: {}".format(coil_idx))
+
+        new_coil = new_coil.reset_index()
+        new_coil.loc[:,'coil_idx'] = ([coil_dict[pid] for pid in coil_idx])
+        new_coil_idx = [int(new_coil['coil_idx'])]
+        
+        user_similarities = cosine_similarity(new_coil_bin[self.coil_columns], coil_bins)[0]
+        most_similar_idx = np.argsort(user_similarities)[::-1]
+
+        most_similar_idx = most_similar_idx[user_similarities[most_similar_idx] > simi_thresh_similar_coils][:N_min_similar_coil_classes]
+        if most_similar_idx.shape[0] < N_min_similar_coil_classes:
+          most_similar_idx = np.argsort(user_similarities)[::-1]
+          most_similar_idx = most_similar_idx[:N_min_similar_coil_classes]
+        
+        final_res = df.loc[df['coil_idx'].isin(most_similar_idx)]
+        # Extract only those values where quality_column is not 0 (none of coil used that recipe)
+        final_res = final_res.loc[final_res[self.quality_column] != 0]
+
+        final_res["Jtot"] = calculateCriterion(final_res["velocity_mdr"].values, final_res[self.quality_column].values,
+                                               self.bounds[pass_nr], dh_tol=dh_tol, lambda1=opt_lambda1)
+        #idxs_best = np.argsort(final_res["Jtot"].values)
+
+        final_res = final_res.sort_values('Jtot')[self.recipe_columns+['Jtot']].copy()
+        final_res = final_res.iloc[0:N_best_recipes_clust]
+
+        # Normalize the selected columns using the min-max scaling
+        selection = (final_res[self.recipe_columns] - final_res[self.recipe_columns].min()) / (final_res[self.recipe_columns].max() - final_res[self.recipe_columns].min())
+        selection['Jtot'] = final_res['Jtot']
+        
+        # Initialize DBSCAN
+        dbscan = DBSCAN(eps=0.15, min_samples=3)
+
+        # Perform clustering
+        final_res['cluster'] = dbscan.fit_predict(selection[self.recipe_columns])
+        final_res = final_res.loc[final_res['cluster'] != -1] # We do not want outliers
+        final_res = final_res.groupby('cluster').mean()
+        final_res = final_res.sort_values('Jtot')
+        #print(final_res)
+        #print("Selected cluster: {}".format(final_res.index[0]))
+        final_res = final_res.iloc[[0]].reset_index(drop=True)
+        final_res = final_res[self.recipe_columns]
+                
+        new_recipe_bin = pd.DataFrame()
+        for column in self.recipe_columns:
+          new_recipe_bin[column]  = get_bin_labels(final_res[column].values, categorizers[column], padding=2)
+        new_recipe_idx = new_recipe_bin[self.recipe_columns].astype(str).apply(lambda x: ''.join(x), axis=1)
+        new_recipe_idx = new_recipe_idx.values
+        # Find similar coil if necessary
+        if not (new_recipe_idx in list(recipe_dict.keys())):
+            print("Finding similar of: {}".format(new_recipe_idx))
+            new_recipe_idx = most_similar_index(new_recipe_idx[0], list(coil_dict.keys()))
+            new_recipe_idx = [new_recipe_idx]  # Convert to suitable type for transforming in tensor
+            print("Found similar: {}".format(new_recipe_idx))
+        new_recipe_idx = ([recipe_dict[pid] for pid in new_recipe_idx])
+
+        final_res['pred'] = self.predictQuality(final_res[self.recipe_columns], new_coil, new_coil_idx)
+
+        return final_res, new_coil, new_coil_idx, new_recipe_idx
+
     def get_recipe(self, coil_df, pass_nr, dh_tol, opt_lambda1=opt_lambda1_def):
         
         coil_df.loc[:,'pass_nr'] = pass_nr
@@ -313,8 +417,11 @@ class ZRMrecsys():
         if self._infer_type == 'optimise' or self._infer_type=='optimize':
             opt_res = self.optimize(coil_df, pass_nr, dh_tol, opt_lambda1)
 
-        elif self._infer_type == 'optimise_adv' or self._infer_type == 'optimize_adv':
-            opt_res = self.optimize_adv(coil_df, pass_nr, dh_tol, opt_lambda1)
+        elif self._infer_type == 'optimise_1' or self._infer_type == 'optimize_1':
+            opt_res = self.optimize_1(coil_df, pass_nr, dh_tol, opt_lambda1)
+            
+        elif self._infer_type == 'optimise_2' or self._infer_type == 'optimize_2':
+            opt_res = self.optimize_2(coil_df, pass_nr, dh_tol, opt_lambda1)
             
         elif self._infer_type == 'recommend':
             opt_res = self.recommend(coil_df, pass_nr, dh_tol, opt_lambda1)
@@ -324,7 +431,6 @@ class ZRMrecsys():
 
             
     def predictQuality(self, x_suggested, new_coil, coil_idx):
-
         # prepare new_recipe_idx
         x_args = torch.Tensor(sc_coil.transform(new_coil[self.coil_columns])).to(torch.float32)
         coil_idx = torch.Tensor(coil_idx).to(torch.int32)
@@ -423,7 +529,6 @@ class ZRMrecsys():
       return bounds
 
 if __name__ =='__main__':
-  
     with open("example_call_json.json") as f:
         data_json = json.load(f)
     data_json = data_json["1"]
@@ -441,11 +546,12 @@ if __name__ =='__main__':
 
     res1 = recsys_obj.recommend(coil_df, pass_nr, dh_tol, lambda1)
     #print(res1[0])
-    res2 = recsys_obj.optimize(coil_df, pass_nr, dh_tol, lambda1)
+    res2 = recsys_obj.optimize_1(coil_df, pass_nr, dh_tol, lambda1)
     #print(res2)
-    res3 = recsys_obj.optimize_adv(coil_df, pass_nr, dh_tol, lambda1)
+    res3 = recsys_obj.optimize_2(coil_df, pass_nr, dh_tol, lambda1)
     #print(res3)
-
+    #res = recsys_obj.optimize(coil_df, pass_nr, dh_tol, lambda1)
+    
     final_res = pd.concat([res1[0], res2, res3]).astype(float).round(2)
     print(final_res.values)
 
